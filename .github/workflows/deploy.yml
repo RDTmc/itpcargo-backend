@@ -1,0 +1,135 @@
+name: Deploy Backend to EC2
+
+on:
+  push:
+    branches: [deploy]
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  build-and-deploy-ventas:
+    name: Build and Deploy Ventas
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        run: docker build -t backend-ventas:latest ./Springboot-API-REST
+
+      - name: Tag and push to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker tag backend-ventas:latest $ECR_REGISTRY/itpcargo-backend-ventas:latest
+          docker push $ECR_REGISTRY/itpcargo-backend-ventas:latest
+
+  build-and-deploy-despacho:
+    name: Build and Deploy Despacho
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        run: docker build -t backend-despacho:latest ./Springboot-API-REST-DESPACHO
+
+      - name: Tag and push to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker tag backend-despacho:latest $ECR_REGISTRY/itpcargo-backend-despacho:latest
+          docker push $ECR_REGISTRY/itpcargo-backend-despacho:latest
+
+  deploy-to-ec2:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: [build-and-deploy-ventas, build-and-deploy-despacho]
+
+    steps:
+      - name: Deploy Ventas and Despacho to EC2
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Configurar AWS CLI con credenciales temporales
+            export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+            export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            export AWS_SESSION_TOKEN=${{ secrets.AWS_SESSION_TOKEN }}
+
+            # Login a ECR desde EC2
+            aws ecr get-login-password --region us-east-1 | \
+              docker login --username AWS --password-stdin 791990722630.dkr.ecr.us-east-1.amazonaws.com
+
+            # Descargar imágenes actualizadas
+            docker pull 791990722630.dkr.ecr.us-east-1.amazonaws.com/itpcargo-backend-ventas:latest
+            docker pull 791990722630.dkr.ecr.us-east-1.amazonaws.com/itpcargo-backend-despacho:latest
+
+            # Detener contenedores anteriores
+            docker stop itpcargo-ventas || true
+            docker rm itpcargo-ventas || true
+            docker stop itpcargo-despacho || true
+            docker rm itpcargo-despacho || true
+
+            # Contenedores en red interna
+            docker network create itpcargo-net 2>/dev/null || true
+
+            # Levantar Ventas (puerto 8080, conecta a RDS)
+            docker run -d \
+              --name itpcargo-ventas \
+              --restart unless-stopped \
+              --network itpcargo-net \
+              -p 8080:8080 \
+              -e DB_ENDPOINT=itpcargo-db.c1ez2pg4cdse.us-east-1.rds.amazonaws.com \
+              -e DB_PORT=3306 \
+              -e DB_NAME=itpcargo \
+              -e DB_USERNAME=admin \
+              -e DB_PASSWORD=itpcargo2025 \
+              791990722630.dkr.ecr.us-east-1.amazonaws.com/itpcargo-backend-ventas:latest
+
+            # Levantar Despacho (puerto 8081, conecta a RDS)
+            docker run -d \
+              --name itpcargo-despacho \
+              --restart unless-stopped \
+              --network itpcargo-net \
+              -p 8081:8081 \
+              -e DB_ENDPOINT=itpcargo-db.c1ez2pg4cdse.us-east-1.rds.amazonaws.com \
+              -e DB_PORT=3306 \
+              -e DB_NAME=itpcargo \
+              -e DB_USERNAME=admin \
+              -e DB_PASSWORD=itpcargo2025 \
+              791990722630.dkr.ecr.us-east-1.amazonaws.com/itpcargo-backend-despacho:latest
+
+            # Limpiar imágenes antiguas
+            docker system prune -f
+
+            echo "Deploy completado"
